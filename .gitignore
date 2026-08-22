@@ -1,0 +1,15 @@
+# Secrets / environment config — never commit real values
+.env
+
+# Django
+db.sqlite3
+__pycache__/
+*.pyc
+
+# Python packaging
+*.egg-info/
+dist/
+build/
+
+# Test/tooling caches
+.pytest_cache/
