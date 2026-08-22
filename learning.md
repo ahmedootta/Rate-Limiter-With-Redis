@@ -184,9 +184,116 @@ d2a82bc5ff38   redis:7-alpine   Up             0.0.0.0:6379->6379/tcp    rate-li
 success (the short form `d2a82bc5ff38` above is the same ID, just
 truncated for display — `docker ps` always shows the short version).
 
-### Django — next up
+### Django — done ✅ (via Dockerfile + Compose)
 
-*(to be filled in once the Django image is built and its container is running)*
+**`Dockerfile`** — defines what's inside the image:
+
+```dockerfile
+FROM python:3.12-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+CMD ["python", "manage.py", "runserver", "0.0.0.0:8000"]
+```
+
+| Line | Role |
+|---|---|
+| `FROM python:3.12-slim` | Base image — Python pre-installed, same role `node:20` played for React. |
+| `WORKDIR /app` | Every instruction after runs from `/app`; also where a container from this image starts. |
+| `COPY requirements.txt .` then `RUN pip install ...` | Copies and installs your dependencies at build time. (Simple explanation right below the table.) |
+| `COPY . .` | Copies your project's files into the image at build time. (Simple explanation right below the table.) |
+| `CMD [...]` | Default command if nothing overrides it — same role `bash` played for the React image, just baked in this time. |
+
+**`COPY requirements.txt .` + `RUN pip install ...`:** copies just the
+dependency list in, then installs it — permanently baked into the
+image. Split into two steps, before `COPY . .`, purely so Docker's
+layer cache can skip reinstalling everything when only your app code
+changes, not your dependencies. `--no-cache-dir` skips pip's own
+leftover download cache, which would just be dead weight in a finished
+image.
+
+**`COPY . .`:** copies your code into the image, permanently, at build
+time — nothing more than that. It looks pointless right now only
+because the bind mount in `docker-compose.yml` covers that same path
+while developing — like packing a suitcase (`COPY`) while still wearing
+clothes from your closet (the mount) at home. The suitcase matters the
+day you actually leave home: a real server, with no mount to fall back
+on, where the copied code is all it has.
+
+**Getting it onto a server — three separate steps, not one:**
+```
+docker build  → COPY happens here; the image stays on your own machine
+docker push   → uploads that image to a registry (Docker Hub, etc.)
+docker pull   → the server downloads it onto its own disk
+```
+`COPY` alone never leaves your machine — `push`/`pull` are what actually
+move it.
+
+**Checking your story:** almost exactly right, two small word swaps —
+`COPY` *copies*, it doesn't *move* (your original project folder on
+your laptop is untouched, still sitting there afterward). And it's not
+"pushed to Docker Hub on your email" — it's pushed to a repository under
+your Docker Hub *account* (you sign up with an email, but the image
+lives in your account's namespace, not literally inside an inbox).
+Everything else is correct: build locally → `docker push` → on the new
+server, `docker pull` (with `docker login` first if the image is
+private) → the entire codebase comes back, because it was already
+baked into the image by `COPY` back in step 1.
+
+**`docker-compose.yml`** — defines how both containers run together:
+
+```yaml
+services:
+  web:
+    build: .
+    command: python manage.py runserver 0.0.0.0:8000
+    volumes:
+      - .:/app
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    depends_on:
+      - redis
+  redis:
+    image: redis:7-alpine
+    # no ports: — reachable only from other containers on this
+    # compose network (i.e. web), not from the host or outside
+```
+
+| Key | Role |
+|---|---|
+| `build: .` | Build our own image from the Dockerfile here — `docker build`, folded into Compose. |
+| `volumes: - .:/app` | The bind mount — file form of `-v $(pwd):/app`. |
+| `ports:` (on `web`) | Same as `-p` — publishes a container port to the host, so we can reach Django's dev server from a browser. |
+| `environment:` | Same as `-e` — env vars handed to the container, here the Redis connection details. |
+| `depends_on:` | Start-order only — `redis` starts before `web`, doesn't wait for it to be *ready*. |
+| `redis: image:` | No build needed — the same pre-built image already run standalone. No `ports:` here at all — see Networking below. |
+
+**Why is the built image/container called `rate-limiter-with-redis-web`, not "django"?** Compose auto-names things as `<project-folder-name>-<service-name>` — it never looks inside the image to see what's actually running. The service is named `web` in the YAML above, so that's what gets used, plus a `-1` instance suffix. To get "django" instead, rename the service key itself, or add an explicit `image:` line to override the generated name.
+
+**Commands, in order:**
+1. `docker compose build web` — builds `web`'s image from the Dockerfile.
+2. `docker compose run --rm web django-admin startproject config .` — one-off container, scaffolds `manage.py`/`config/` onto the host via the bind mount, `--rm` cleans up after.
+3. `docker compose up` — starts `web` and `redis` together, streams both logs.
+
+Confirmed via `docker ps` — both running, auto-named
+`rate-limiter-with-redis-web-1` and `rate-limiter-with-redis-redis-1`
+(see the naming note above):
+
+```
+CONTAINER ID   IMAGE                          STATUS         PORTS                     NAMES
+e78e4ae67d41   rate-limiter-with-redis-web    Up             0.0.0.0:8000->8000/tcp    rate-limiter-with-redis-web-1
+9c42e0e84b49   redis:7-alpine                 Up             6379/tcp                  rate-limiter-with-redis-redis-1
+```
+
+Note `redis-1` has no `0.0.0.0:6379->6379` mapping — exactly as intended
+after removing `ports:` from the `redis` service earlier: only reachable
+from `web`, not from the host.
+
+**Networking:** `docker compose up` auto-creates one shared bridge network and attaches both services to it — the exact `docker network create` + `connect` sequence from the Networking section, automated. Compose's embedded DNS then resolves the *service name* `redis` to that container's current internal IP, so `redis.Redis(host="redis", port=6379)` in Django code resolves and switches straight across the shared bridge — no host, no NAT involved at all. Because container-to-container traffic never touches the host's published-port mechanism in the first place, `redis` doesn't need a `ports:` entry to be reachable by `web` — publishing a port is *only* ever about host/outside access. Dropping it entirely is what actually restricts Redis to "only the Django container can reach it," which is stronger than any host-IP-binding trick (`0.0.0.0` vs `127.0.0.1`) could achieve, since those still expose it to the host.
 
 ---
 
@@ -207,92 +314,94 @@ build a React app without ever installing Node on your laptop itself.
 
 **Step 1 — Open a shell *inside* the isolated device**
 
-First, on your host, you'd actually be sitting inside the project
-folder before typing anything Docker-related:
+First, sit inside the project folder before typing anything Docker-related:
 
 ```
 cd ~/my-react-app
 docker run -it --rm -v "$(pwd)":/app -w /app --name react-dev node:20 bash
 ```
 
-The mapping you're looking for **is** in the command — it's just not a
-literal, hardcoded path. `-v "$(pwd)":/app` means "bind-mount `<host
-path>:<container path>`," and `$(pwd)` is a piece of *shell*
-substitution, not something Docker understands: your terminal runs
-`pwd` (which just prints "what directory am I sitting in right now")
-*before* Docker ever sees the command, and swaps in that literal text.
-So because you `cd`'d into `~/my-react-app` first, `$(pwd)` silently
-expands to `/home/you/my-react-app`, and the command Docker actually
-receives is effectively:
+The mapping is right there in `-v "$(pwd)":/app` — just not hardcoded.
+`$(pwd)` is *shell* substitution, not something Docker understands: your
+terminal runs `pwd` and swaps in the result *before* Docker ever sees
+the command. Since you `cd`'d into `~/my-react-app` first, Docker
+actually receives `-v /home/you/my-react-app:/app`. Writing it out
+explicitly as `-v ~/my-react-app:/app` does the exact same thing
+without depending on your current directory — clearer while the mental
+model is still new.
 
-```
-docker run -it --rm -v /home/you/my-react-app:/app -w /app --name react-dev node:20 bash
-```
+`node:20 bash` at the end isn't one thing — it's two separate
+arguments, `IMAGE` then `COMMAND` (`docker run [flags] IMAGE
+[COMMAND]`, same shape covered earlier). `node:20` is the image.
+`bash` is the command to run inside it, overriding whatever that
+image's own default startup command is. It only works because this
+particular image's base OS-userspace layer happens to include `bash` as
+one of its normal tools — not every image does. Some lightweight image
+variants ship a minimal shell instead and would fail with "bash: not
+found" for the exact same command. Same idea as "each image brings its
+own OS-userspace files" from Core Concepts — different images, different
+included tools, never something to assume is just there.
 
-`$(pwd)` is just a convenience so you don't have to type the full path
-by hand — it always means "wherever my terminal currently is." Writing
-it out explicitly, `-v ~/my-react-app:/app`, would do the exact same
-thing without relying on your current directory at all — that version
-makes the mapping visible at a glance, which is probably clearer while
-you're still building the mental model.
-
-`-it` attaches your terminal to a live shell running *inside* that
-container — a genuinely separate device from the OS's point of view: its
-own process list, its own network stack, its own filesystem root, all
-the isolation from the "Docker Engine vs a Hypervisor" section earlier.
-Proof: run `hostname` at that prompt — it prints a random container ID,
-not your laptop's real hostname. Every command you type from here on
-executes *inside* that isolated device, not on your laptop.
+The remaining flags:
+- `-it` — attaches your terminal to a live shell running *inside* that
+  container. Proof it's a genuinely separate device: `hostname` at that
+  prompt prints a random container ID, not your laptop's.
+- `--rm` — deletes the container the moment you exit the shell; a
+  disposable dev shell has no reason to stick around afterward.
+- `-w /app` — starts the shell in `/app`, the folder just mounted,
+  instead of some default root directory.
+- `--name react-dev` — a human-readable handle for this specific
+  container. Here's why that matters: your first terminal is now
+  "stuck" running an interactive shell inside the container — if you
+  leave it running `npm run dev` there, that terminal is busy watching
+  logs. To do anything else at the same time (say, `npm install` a new
+  package) without stopping the dev server, open a *second* terminal
+  window on your host and run `docker exec -it react-dev bash`.
+  `docker exec` doesn't create a new container the way `docker run`
+  does — it opens another shell *into the same, already-running*
+  container, found by the name you gave it. Both terminals end up
+  inside the identical isolated environment, seeing the same processes
+  and the same mounted files.
 
 **Step 2 — Install React 18.3 — where do these files physically land?**
 
 At that prompt: `npm install react@18.3.1`.
 
-The question: does this write bytes onto the container's own private
-"hard disk," or onto your laptop's real one? **It depends entirely on
-which path you're writing to:**
+Does this land on the container's own private disk, or your laptop's
+real one? Depends entirely on the path:
 
-- We're sitting in `/app` (via `-w /app`), and `/app` is bind-mounted to
-  `~/my-react-app` on your host (that's what `-v "$(pwd)":/app` set up
-  in Step 1). So `npm install` creates `/app/node_modules` — and because
-  `/app` is a live window onto your host folder, not a copy,
-  `node_modules` appears on your **actual laptop disk**, inside
-  `~/my-react-app/node_modules`, in real time. Open a totally separate
-  terminal on your host, outside Docker entirely, and those exact files
-  are sitting right there.
-- Compare that to a global install landing *outside* `/app` — e.g.
-  `npm install -g some-tool`, which writes to a system path like
-  `/usr/lib/node_modules`. That path was never bind-mounted, so it's
-  written only into the container's own private writable layer — a
-  layer that exists solely for this one container, invisible to your
-  host, and gone the instant the container is removed.
+- Plain `npm install` writes to `/app/node_modules` — and since `/app`
+  is that same bind mount from Step 1, `node_modules` physically
+  appears in `~/my-react-app/node_modules` on your actual laptop disk,
+  instantly. A separate terminal on your host, outside Docker entirely,
+  sees those exact files.
+- A **global** install instead (`npm install -g some-tool`) writes to a
+  system path like `/usr/lib/node_modules` — never bind-mounted, so it
+  lands only in the container's own private writable layer: disposable,
+  invisible to your host, gone the instant the container is removed.
 
-So yes, a container does have something like its own hard disk: its
-filesystem is the read-only image layers (Node.js, pre-baked into
-`node:20`) plus one thin writable layer created just for *this*
-container. Anything you install normally lands there — private,
-disposable. A bind mount punches a hole through that private disk at
-one specific path and replaces it with a direct, live connection to a
-real folder on your host's real disk. Same command, two entirely
-different destinations, depending only on the path.
+So a container does have something like its own hard disk: read-only
+image layers (Node.js, baked into `node:20`) plus one thin writable
+layer created just for this container. Anything installed normally
+lands there — private, disposable — unless a bind mount punches a hole
+through it at a specific path and redirects to a real folder on the
+host instead. Same command, two different destinations, depending only
+on the path.
 
 **What if you delete the container while developing?**
 
-`node_modules` and the React version you installed live inside `/app`,
-which is your host folder — so `docker rm react-dev` (or `--rm` cleaning
-up automatically on exit) doesn't touch them at all. They're still
-sitting on your laptop's real disk. Only things written *outside* `/app`
-— that hypothetical global tool — vanish with the container.
+`node_modules` and your React version live inside `/app` — your host
+folder — so `docker rm react-dev` (or `--rm` on exit) leaves them
+untouched. Only things written *outside* `/app`, like that global tool,
+vanish with the container.
 
 **What if you delete the files on your *host* while the container is running?**
 
-The opposite direction: delete `~/my-react-app/node_modules` from your
-laptop, in a normal terminal, while the container's dev server is still
-running — since `/app` inside the container *is* that same folder, not
-a copy, it goes empty on the container's side too, instantly. The
-running process would likely crash with "module not found," because its
-files just vanished from under it in real time. There's no independent
-backup on either side — one folder, viewed from two places at once.
+Reverse direction: delete `~/my-react-app/node_modules` on your laptop
+while the dev server's still running — since `/app` *is* that same
+folder, not a copy, it empties on the container's side instantly too,
+likely crashing the process with "module not found." No independent
+backup either way — one folder, viewed from two places.
 
 **Q: What actually lets you delete a container and rebuild it with everything the same — the bind mount, the image, all of it?**
 
