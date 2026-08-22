@@ -21,16 +21,19 @@ parses the raw HTTP request into a Django `request` object
 MIDDLEWARE chain — request travels top → bottom through the list
       │
       ▼
-RateLimiterMiddleware (last in the list, closest to the view)
+RateLimiterMiddleware (first in the list — the very first thing
+that runs on every request, before Django does anything else)
       │
-      ├─ under limit ──► URL routing (config/urls.py) ──► view function ──► response
+      ├─ under limit ──► the other 7 built-in middlewares ──► URL routing
+      │                  (config/urls.py) ──► view function ──► response
       │
-      └─ over limit  ──► 429 JsonResponse, built right here — the view is
-                          never reached at all
+      └─ over limit  ──► 429 JsonResponse, built right here — nothing
+                          else runs at all: not the other middlewares,
+                          not URL routing, not the view
       │
       ▼
-Response travels back UP through the same MIDDLEWARE chain,
-bottom → top, in reverse
+Response travels back UP through whichever middlewares actually ran,
+in reverse
       │
       ▼
 Back through Docker's port mapping, back to curl/browser
@@ -60,6 +63,7 @@ Our current list, in order:
 
 ```python
 MIDDLEWARE = [
+    'django_rate_limiter.middleware.RateLimiterMiddleware',   # ← ours, first
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
@@ -67,81 +71,84 @@ MIDDLEWARE = [
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
-    'django_rate_limiter.middleware.RateLimiterMiddleware',   # ← ours, last
 ]
 ```
 
 Each middleware is really just a wrapper around "the rest of the
-chain." Picture it like nested envelopes: `SecurityMiddleware` wraps
-`SessionMiddleware`, which wraps `CommonMiddleware`, and so on, down to
-ours at the very center, right next to the view. Concretely, each one
-does some setup, then calls `self.get_response(request)` — which is
-just "hand it to whatever's next" — and whatever that call *returns* is
-this middleware's own response too, usually unmodified.
+chain." Picture it like nested envelopes: ours now wraps
+`SecurityMiddleware`, which wraps `SessionMiddleware`, and so on, down
+to the view at the very center. Concretely, each one does some setup,
+then calls `self.get_response(request)` — which is just "hand it to
+whatever's next" — and whatever that call *returns* is this
+middleware's own response too, usually unmodified.
 
-Because ours is placed **last**, it's the final stop before the actual
-view — everything before it in the list has already run by the time we
-check the rate limit.
+Because ours is placed **first**, it's the very first thing that runs
+on every request — before Django has done *anything* else: no session
+lookup, no CSRF processing, no auth. If we reject here, none of that
+work ever happens.
 
-### Shouldn't the rate limiter be *first*, not last?
+### Why first, not last?
 
-Fair challenge, and for pure efficiency: yes, you're right. Placing it
-last means every rejected request still pays for all seven built-in
-middlewares' work first — session lookup, CSRF processing, auth,
-messages, clickjacking headers — before we even glance at Redis to
-reject it. That's wasted work on requests we were always going to
-refuse. Moving `RateLimiterMiddleware` to the *top* of the list (right
-after or even before `SecurityMiddleware`) would reject abusive traffic
-before Django does any of that other processing at all — the more
-efficient placement under real load.
+This used to be last, closest to the view — and that was worth
+questioning: placing it last meant every rejected request still paid
+for all seven built-in middlewares' work *before* we ever checked
+Redis. That's wasted work on requests we were always going to refuse.
+Moved to first, an abusive request gets rejected before Django does
+anything else at all — the efficient placement under real load.
 
-It was placed last here mostly by default, not as a deliberate
-optimization. The one (minor) reason "last" can matter: if you ever
-want to rate-limit by the *authenticated user* instead of just IP,
-you'd need `AuthenticationMiddleware` to have already populated
-`request.user` — which only happens if you're positioned *after* it.
-Our current middleware only ever reads the raw IP, never
-`request.user`, so that reason doesn't actually apply to us — nothing
-functionally requires "last" here. Moving it near the top would be a
-straightforward, genuinely better change.
+One trade-off worth knowing about the move: previously, even a 429
+response still passed back out through all seven built-in middlewares
+(so e.g. `SecurityMiddleware` could still attach its response headers
+to it). Now that we're first, a 429 we return skips *all* of them
+entirely in both directions — nothing before us exists anymore to
+process it on the way out. For a plain JSON 429 that's a fine trade,
+but it's the kind of detail worth remembering if a later middleware's
+behavior (security headers, CORS, etc.) ever needs to apply even to
+rejected requests.
+
+The one scenario where "first" would be the *wrong* call: rate-limiting
+by the *authenticated user* instead of raw IP, which needs
+`AuthenticationMiddleware` to have already populated `request.user` —
+only true if positioned *after* it. Our middleware only ever reads the
+raw IP, so that doesn't apply here.
 
 ---
 
 ## Walkthrough 1 — under the limit
 
-1. Request enters, travels through all seven built-in middlewares
-   (each just passes it along).
-2. Reaches `RateLimiterMiddleware.__call__`:
+1. Request enters. `RateLimiterMiddleware.__call__` runs **first**,
+   before any built-in middleware:
    - Gets the client IP.
    - `redis_client.incr("rate_limit:<ip>")` → still under `RATE_LIMITER_MAX_REQUESTS`.
    - Calls `self.get_response(request)` — passing the request onward.
-3. Since ours is last, "onward" now means **URL routing**: Django takes
-   the request path (`/api/ping/`) and matches it against `urlpatterns`
-   in `config/urls.py`, finds `path('api/ping/', ping)`, and calls the
-   `ping(request)` view function.
+2. "Onward" now means the seven built-in middlewares run, one by one
+   (session lookup, CSRF, auth, etc.), each just passing the request
+   further along.
+3. Then **URL routing**: Django takes the request path (`/api/ping/`)
+   and matches it against `urlpatterns` in `config/urls.py`, finds
+   `path('api/ping/', ping)`, and calls the `ping(request)` view
+   function.
 4. `ping()` returns `JsonResponse({'status': 'ok'})`.
-5. That response is what `self.get_response(request)` returned inside
-   our middleware — so `return self.get_response(request)` just hands
-   it straight back up, unmodified.
-6. The response bubbles back up through the other seven middlewares in
-   reverse order (each may attach things like security headers), then
-   out through the dev server, back to `curl` as a real `200`.
+5. That response bubbles back up through the seven built-in middlewares
+   in reverse (each may attach things like security headers), then
+   back through our middleware — `return self.get_response(request)`
+   just hands it along unmodified — then out through the dev server,
+   back to `curl` as a real `200`.
 
 ## Walkthrough 2 — over the limit
 
-1. Same as above through step 2 — but this time
+1. Same as above through the first check — but this time
    `redis_client.incr(...)` returns a count *above*
    `RATE_LIMITER_MAX_REQUESTS`.
 2. Instead of calling `self.get_response(request)`, we build and
    `return` a `JsonResponse({'error': 'Too many requests'}, status=429)`
    **directly, right here.**
-3. Because `self.get_response` was never called, **URL routing never
-   happens, and `ping()` is never called at all** — the view function
-   doesn't know this request ever existed.
-4. That 429 response still travels back up through the seven earlier
-   middlewares (they already ran their "before" half on the way in, and
-   now get a chance to run their "after" half on this response too),
-   then out to `curl` as a real `429`.
+3. Because `self.get_response` was never called, and ours is the very
+   first middleware, **nothing else runs at all** — not the other
+   seven middlewares, not URL routing, not `ping()`. The request stops
+   dead at this one check.
+4. The 429 we built goes straight back out through the dev server to
+   `curl` — no other middleware ever touches it, in either direction.
 
 ---
 
