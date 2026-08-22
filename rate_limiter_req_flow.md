@@ -200,6 +200,44 @@ edge case, at the cost of a more involved Redis data structure (e.g. a
 sorted set of timestamps instead of one counter) — worth knowing as a
 follow-up, not something this implementation needs to solve right now.
 
+### Why do two different IPs get fully independent windows?
+
+One line is doing all the work:
+
+```python
+key = f"rate_limit:{client_ip}"
+```
+
+Every Redis command in this middleware (`incr`, `expire`) always
+operates on exactly *one* named key — never on "all keys" or "keys like
+this one." Redis has no built-in concept of these keys being related at
+all; to Redis, `rate_limit:1.2.3.4` and `rate_limit:5.6.7.8` are just
+two unrelated strings, the same way two different variable names in a
+program don't share state just because they're similar-looking.
+
+Since `client_ip` is baked directly into the key string, every distinct
+IP ends up incrementing and expiring a completely separate key:
+
+```
+IP 1.2.3.4 → key "rate_limit:1.2.3.4" → its own counter, its own TTL
+IP 5.6.7.8 → key "rate_limit:5.6.7.8" → its own counter, its own TTL
+```
+
+Concretely: IP `1.2.3.4` could send 5 requests and get fully rate-limited
+(hitting `429`s) while, at that exact same moment, IP `5.6.7.8` sends
+its very first request and gets a clean `200` — because
+`redis_client.incr("rate_limit:5.6.7.8")` never reads or touches
+`rate_limit:1.2.3.4` in any way. There's no shared counter anywhere in
+this design; "independent per IP" isn't a feature that had to be built,
+it falls out for free from Redis keys being independent by nature, and
+the IP simply being part of the key name.
+
+(Worth noting: `_get_client_ip` — the method right below — is what
+decides *which* string becomes `client_ip` in the first place, reading
+`X-Forwarded-For` first and falling back to `REMOTE_ADDR`. Whatever
+that method returns is exactly what ends up in the key, so two requests
+only share a window if that method returns the same string for both.)
+
 ---
 
 ## What code was actually necessary, and where it plugs in
