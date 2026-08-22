@@ -6,7 +6,11 @@ services:
       - .:/app
     ports:
       - "8000:8000"
+    env_file:
+      - .env
     environment:
+      # override .env's REDIS_HOST/PORT — inside this container, Redis
+      # is only reachable at the service name "redis", never localhost
       - REDIS_HOST=redis
       - REDIS_PORT=6379
     depends_on:
