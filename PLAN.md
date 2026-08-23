@@ -214,6 +214,14 @@ proper comparison rather than reusing possibly-stale assumptions from the
 original plan. What's fixed: whatever we pick must run the same Docker image
 built for local dev, so there's no "works in Docker, breaks in prod" gap.
 
+**Deploying doesn't replace local testing — it adds a second, separate
+target.** "Deployed" just means the app is reachable by others, on a real
+server, independent of the laptop being on; local dev via `docker compose up`
+stays the everyday loop (fast, free, instant feedback). Deployment happens
+on top of that, periodically — both to make the app actually usable by
+others, and as a secondary check that it behaves the same in a real
+environment, not as a replacement for testing on localhost.
+
 ## Packaging Plan (Reusable Across Projects)
 
 The middleware is built to be dropped into *any* Django project, not just
@@ -224,6 +232,66 @@ the full stack app above:
   `RATE_LIMITER_WINDOW_SECONDS`)
 - Only real dependency is a reachable Redis instance
 - Versioned and tagged so downstream projects can pin a version
+
+---
+
+## Toward "Enterprise-Grade" (Proposed — Not Yet Approved)
+
+Ahmed's question: what would this need to become enterprise-grade, like
+Cloudflare's rate limiter? This is a menu to react to, not a committed
+addition to the roadmap — approve or reject each one before it moves into
+a Month/Week above.
+
+### Tier 1 — actual gaps in the current code, not "missing features"
+
+1. **`X-Forwarded-For` is trusted blindly, unvalidated.** Right now any
+   client can set this header themselves to any value and bypass rate
+   limiting entirely — `_get_client_ip` just reads whatever's there. Real
+   systems only trust this header when the request genuinely came through a
+   *known* reverse proxy (validate against a configured trusted-proxy list,
+   or a configured number of trusted hops). Otherwise `REMOTE_ADDR` alone is
+   safer, even though it's less accurate behind a real proxy.
+2. **No handling if Redis is unreachable.** `redis_client.incr(...)` would
+   raise an exception on every single request the moment Redis has any
+   hiccup — turning a Redis blip into a full outage for the whole app. An
+   intentional choice is missing here: **fail open** (let traffic through if
+   Redis is down, prioritizing availability) vs **fail closed** (block
+   everything, prioritizing protection) — currently neither is chosen on
+   purpose, it just crashes.
+
+### Tier 2 — real feature upgrades, roughly by value
+
+1. Standard rate-limit response headers — `Retry-After`,
+   `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset` — low
+   effort, high value, matches GitHub/Stripe/Cloudflare, lets clients retry
+   correctly instead of guessing.
+2. Per-route/per-view configurable limits (e.g. a login endpoint stricter
+   than a read-only one) instead of one blanket global limit.
+3. Per-authenticated-user limiting, not just per-IP — needed for cases like
+   office wifi/NAT, where many real users share one IP.
+4. A better algorithm — sliding window or token bucket instead of fixed
+   window, closing the boundary-burst edge case already noted in
+   `rate_limiter_req_flow.md`.
+5. Allowlist/denylist config — trusted services bypass limits entirely,
+   known-bad IPs get blocked outright.
+6. Escalating penalties for repeat offenders instead of a flat window that
+   just resets on schedule every time.
+7. Observability — who's getting rate-limited and how often, as metrics/
+   logs, instead of a silent 429 with no visibility.
+
+### The one thing more code genuinely can't fix
+
+Cloudflare's real advantage isn't algorithm sophistication — it's *where*
+the check happens. Cloudflare rejects abuse at the network edge, across a
+globally distributed set of servers, before traffic ever reaches the origin
+server at all. Our middleware runs *inside* Django — by the time we reject
+a request, it already consumed bandwidth, a TCP connection, and CPU time on
+our own server just to get rejected. That's a different architectural
+layer (edge/CDN/reverse-proxy defense) than anything achievable by writing
+more Python here. Worth being honest about this in interviews: this project
+demonstrates *application-level* rate limiting, the kind real systems run
+*in addition to*, not instead of, edge-level protection (Cloudflare, AWS
+WAF, etc.) sitting in front of the origin.
 
 ---
 
