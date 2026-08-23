@@ -238,6 +238,34 @@ decides *which* string becomes `client_ip` in the first place, reading
 that method returns is exactly what ends up in the key, so two requests
 only share a window if that method returns the same string for both.)
 
+### Gotcha: the flip side of "per-IP only" — it's also *not* per-path
+
+The key is `f"rate_limit:{client_ip}"` — IP only, nothing about which
+URL was hit. Combined with the middleware now running *first* (before
+URL routing even happens), this means **every path from the same IP
+shares one counter**, site-wide. That's easy to miss when testing in a
+browser, because a browser doesn't just request the page you asked
+for — it silently also fires `GET /favicon.ico` on every load. Real
+logs from testing `/api/ping/` with `RATE_LIMITER_MAX_REQUESTS=5`:
+
+```
+GET /api/ping/    200   ← "request 1" you meant to send
+GET /favicon.ico  404   ← the browser sent this too, silently
+GET /api/ping/    200   ← "request 2"
+GET /favicon.ico  404   ← silently
+GET /api/ping/    200   ← "request 3" (count now at 5 — the limit)
+GET /favicon.ico  429   ← count 6 — rejected, but you never see this one
+GET /api/ping/    429   ← your "request 4" — actually the 7th real hit
+```
+
+Three visible page loads = six real requests against the same IP-keyed
+counter, so the "4th" request fails right on schedule — the counting
+was correct the whole time, the mental model of "1 reload = 1 request"
+was wrong. **Test with `curl` instead of a browser** to avoid this
+entirely, or scope the middleware to specific paths (e.g. only
+`/api/`) if per-route limiting is actually wanted — see the "per-route
+configurable limits" item in `PLAN.md`'s enterprise-features proposal.
+
 ---
 
 ## What code was actually necessary, and where it plugs in
