@@ -1155,4 +1155,73 @@ kernel, one hop shorter than the diagrams above.
 
 ## Compose
 
-*(to be filled in when we move from separate `docker run` commands to `docker-compose.yml`)*
+Covered in full under **Images & Containers** above (the Django section) —
+the actual `docker-compose.yml`, what each key does, the commands, and how
+its networking automates what "Networking" above covers manually.
+
+---
+
+## Deploying with Docker + CI/CD
+
+### The flow, in plain words
+
+```
+You push code to a chosen branch (e.g. main)
+        │
+        ▼
+GitHub notices the push, starts a pipeline automatically
+        │
+        ▼
+Pipeline builds the Docker image — the SAME Dockerfile as local dev
+        │
+        ▼
+Pipeline starts a container from that image and runs the tests inside it
+        │
+   ┌────┴─────┐
+   ▼          ▼
+tests fail   tests pass
+   │          │
+   ▼          ▼
+STOP —      image gets pushed to a registry (e.g. Docker Hub)
+nothing            │
+deploys            ▼
+            the deploy server pulls that image and swaps it in
+                    │
+                    ▼
+            the live app is now running your new code
+```
+
+The one-sentence version: **nothing you write ever reaches the live server
+directly** — a pipeline rebuilds it from scratch, proves it works, and only
+*then* ships that proven artifact.
+
+### The same flow, in technical terms
+
+- **CI (Continuous Integration)** — the "build + test" half. Every push
+  gets automatically compiled/built and tested, so broken code is caught
+  immediately, not discovered later.
+- **CD (Continuous Deployment/Delivery)** — the "ship it" half. If CI
+  passes, the verified result gets pushed to a registry and rolled out —
+  automatically, with no manual "let me copy the files over" step.
+- **GitHub Actions** — GitHub's built-in CI/CD tool (what `PLAN.md`'s
+  Week 4 already targets). A workflow file
+  (`.github/workflows/ci.yml`) declares which events trigger it (`on:
+  push`) and which steps to run.
+- **Runner** — the temporary machine GitHub spins up to actually execute
+  those steps (itself usually a container) — it's not your laptop, and it
+  doesn't persist between runs.
+- **Registry** — where the built image gets stored after tests pass (Docker
+  Hub, GitHub Container Registry, etc.) — the deploy target pulls *from*
+  here, not from your repo's source code directly.
+- **Image tag** — built images are usually tagged with the git commit SHA
+  or a version number, so at any moment you know *exactly* which commit is
+  currently live, and can roll back to a previous tag instantly if a
+  deploy goes bad.
+
+**Why test *inside the built container*, not just the raw code?** Because
+it proves the exact artifact about to ship actually works — the same
+Dockerfile, the same dependency versions, the same environment as
+production — closing the "works on my machine, breaks in prod" gap
+`PLAN.md`'s Deployment Plan already calls out. Testing raw source code
+outside a container only proves the code is correct in isolation, not that
+the shipped image is.
