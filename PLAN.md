@@ -206,12 +206,16 @@ my-fullstack-app/
 
 ## Deployment Plan (Free Options)
 
-Deployment target is free-tier hosting for both the package demo and the
-full stack app. Concretely deciding *which* provider(s) — Railway, Render,
-Fly.io, Vercel, etc. — and their current free-tier limits is a dedicated
-follow-up discussion, since these offerings change often and deserve a
-proper comparison rather than reusing possibly-stale assumptions from the
-original plan. What's fixed: whatever we pick must run the same Docker image
+**Decided: Render**, checked August 2026. Fly.io dropped its free tier in
+Oct 2024 (now $5/mo minimum); Railway's "free" plan is really a one-time $5
+trial credit then $1/mo + usage. Render is the one still genuinely free:
+free web service (512MB RAM, sleeps after 15 min idle, cold-starts the next
+request), free Redis (25MB, in-memory only — plenty for rate-limit
+counters), builds straight from our Dockerfile, auto-deploys from a chosen
+GitHub branch (`release`), no credit card required. These offerings change
+often, so re-verify before assuming this still holds much later.
+
+What's fixed regardless of provider: it must run the same Docker image
 built for local dev, so there's no "works in Docker, breaks in prod" gap.
 
 **Deploying doesn't replace local testing — it adds a second, separate

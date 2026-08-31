@@ -173,6 +173,12 @@ docker run -d --name rate-limiter-redis -p 6379:6379 redis:7-alpine
 | `-p 6379:6379` | Publishes host port 6379 → container port 6379 (installs the iptables DNAT rule from the Networking section). |
 | `redis:7-alpine` | The image to run — already local, so it started instantly with no download. |
 
+**Why does it listen on 6379 with no port specified anywhere?** Not
+Docker's doing — the image's `CMD` is just `redis-server`, no port
+flag, so it's Redis's own hardcoded default. `EXPOSE 6379` in the image
+is separate, pure documentation — it doesn't cause the listening or
+publish anything.
+
 Confirmed via `docker ps`:
 
 ```
@@ -1225,3 +1231,46 @@ production — closing the "works on my machine, breaks in prod" gap
 `PLAN.md`'s Deployment Plan already calls out. Testing raw source code
 outside a container only proves the code is correct in isolation, not that
 the shipped image is.
+
+---
+
+## Deploying This Project — the Actual Steps
+
+The concepts above, turned into an ordered, hands-on checklist — same
+one-step-at-a-time style as the Docker sections. Host: **Render** (see
+`PLAN.md`'s Deployment Plan for why). Pipeline trigger: pushes to the
+`release` branch you already made.
+
+1. **Sign up at Render, connect your GitHub account.** An account action —
+   only you can do this one.
+2. **Create a Render "Web Service" from this repo, branch `release`.**
+   Render reads our `Dockerfile` directly and builds from it — literally
+   `docker build`, just running on Render's infrastructure instead of your
+   laptop. Same Dockerfile, zero changes needed for this step alone.
+3. **Create a Render "Redis" instance (free tier).** Render gives you an
+   internal host/port for it — set those as `REDIS_HOST`/`REDIS_PORT` env
+   vars on the web service, in Render's dashboard.
+4. **Set the rest of the env vars in Render's dashboard** —
+   `SECRET_KEY` (a real one this time, not the dev fallback),
+   `RATE_LIMITER_MAX_REQUESTS`, `RATE_LIMITER_WINDOW_SECONDS`. This is the
+   "real deploys don't use a `.env` file" lesson from earlier, made
+   concrete — same variable names, sourced from Render's panel instead.
+5. **Turn on auto-deploy for the `release` branch specifically.** Render
+   rebuilds and redeploys automatically on every push to it — the "CD"
+   half of the pipeline, provided by the host itself.
+6. **Write minimal `pytest` tests** (under limit → 200, over limit → 429 —
+   from `PLAN.md`'s original Week 1-2 spec, not done yet). Needed before
+   step 7 means anything — a pipeline that "tests" nothing isn't a gate.
+7. **Add `.github/workflows/ci.yml`, triggered on push to `release`:**
+   build the image, run those tests inside it. This is the "CI" half —
+   independent of Render's own build, a separate proof the code is good.
+8. **Wire the gate: only deploy if tests pass.** Render's auto-deploy from
+   step 5 will happily deploy broken code, since it never runs our tests
+   itself. Fix: turn off auto-deploy, and have the GitHub Actions workflow
+   call Render's **Deploy Hook** (a URL Render gives you) as its last
+   step — but only after the test step succeeds. Now a red test run
+   blocks the deploy entirely, which is the actual point of a pipeline.
+9. **Verify on the real, live URL** — hit the deployed `/api/ping/`
+   endpoint for real, confirm the 429 behavior. Expect a slow first
+   request if it's been idle 15+ minutes (the free tier's cold start,
+   not a bug).
