@@ -1274,3 +1274,91 @@ one-step-at-a-time style as the Docker sections. Host: **Render** (see
    endpoint for real, confirm the 429 behavior. Expect a slow first
    request if it's been idle 15+ minutes (the free tier's cold start,
    not a bug).
+
+### Writing `.github/workflows/ci.yml` yourself, piece by piece
+
+Covers steps 7-8 above in enough detail to actually type it. It must live
+at exactly that path — `.github/` at the repo root, `workflows/` inside
+it — GitHub only ever scans that one folder for pipeline files.
+
+**1. `name:` and the trigger**
+```yaml
+name: CI/CD
+
+on:
+  push:
+    branches:
+      - release
+```
+`name:` is purely cosmetic — just the label GitHub shows in its Actions
+tab. `on:` is the trigger: run this workflow whenever someone pushes to
+`release`, specifically (not `main`, not every branch).
+
+**2. The job and its runner**
+```yaml
+jobs:
+  test-and-deploy:
+    runs-on: ubuntu-latest
+```
+A workflow is one or more `jobs:`; `test-and-deploy` is just a name you
+pick. `runs-on: ubuntu-latest` is which machine GitHub hands you to run
+it on — a fresh, empty Linux VM every single time, thrown away after.
+
+**3. A Redis sidecar for the test run**
+```yaml
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+```
+`services:` is GitHub Actions' own version of "run a second container
+alongside this job" — same idea as Compose's `redis` service, just
+scoped to this one CI run. It's reachable at `localhost:6379` from the
+runner for the whole job.
+
+**4. The steps, in order**
+```yaml
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+```
+Runners start **empty** — no repo, no code. This step is what actually
+clones your repo onto the runner; skip it and every later step would be
+operating on nothing.
+
+```yaml
+      - name: Build the Docker image
+        run: docker build -t rate-limiter-web .
+```
+The exact same `docker build` you'd type locally — just executing on
+GitHub's machine instead of yours.
+
+```yaml
+      - name: Run tests inside the built image
+        run: |
+          docker run --rm --network host \
+            -e REDIS_HOST=localhost -e REDIS_PORT=6379 \
+            -e SECRET_KEY=ci-test-key \
+            rate-limiter-web python manage.py test
+```
+Testing *inside the image we just built*, not raw source — the same
+"proves the shipped artifact works" reasoning from earlier. `--network
+host` is what lets this container reach `localhost:6379` — the
+runner's own network, where step 3's Redis service published its port.
+The `-e` flags hand in the env vars `settings.py` expects, the same
+`os.environ.get(...)` pattern used everywhere else, CI included.
+
+```yaml
+      - name: Deploy to Render
+        if: success()
+        run: curl -X POST "${{ secrets.RENDER_DEPLOY_HOOK }}"
+```
+This is what step 8 means by "the gate." `if: success()` makes this
+step's intent explicit (a failed earlier step already skips later ones
+by default — this just says so out loud). `${{ secrets.RENDER_DEPLOY_HOOK }}`
+pulls the actual URL from **GitHub's own Secrets store** (repo →
+Settings → Secrets and variables → Actions) — never hardcoded in the
+file itself. Same "secrets live in the platform, not in committed
+files" pattern as `.env` locally and Render's dashboard in production,
+just GitHub's version of it this time.
