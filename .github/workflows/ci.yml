@@ -23,3 +23,6 @@ jobs:
             -e REDIS_HOST=localhost -e REDIS_PORT=6379 \
             -e SECRET_KEY=ci-test-key \
             rate-limiter-web pytest 
+      - name: Deploy to Render
+        if: success()
+        run: curl -X POST "${{ secrets.RENDER_DEPLOY_HOOK }}"         
