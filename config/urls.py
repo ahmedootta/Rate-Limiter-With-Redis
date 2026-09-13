@@ -23,7 +23,12 @@ def ping(request):
     return JsonResponse({'status': 'ok'})
 
 
+def health(request):
+    return JsonResponse({'status': 'healthy'})
+
+
 urlpatterns = [
     path('admin/', admin.site.urls),
     path('api/ping/', ping),
+    path('health', health),
 ]
